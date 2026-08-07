@@ -327,6 +327,10 @@ export type DefectLine = {
   work: string;
   kind: "part" | "labor" | "both";
   strategy: RepairStrategy;
+  /** Why restore vs replace was chosen */
+  decisionReason: string;
+  /** Short alternative that was rejected, e.g. "заміна б/у ~$400" */
+  alternative: string;
   estimateUahMin: number | null;
   estimateUahMax: number | null;
   estimateUsdMin: number | null;
@@ -427,18 +431,14 @@ export function parseDefectList(
         roundMoney(r.estimateUsdMax ?? r.maxUsd),
         fx
       );
-      // legacy single-currency fields stored as estimateUsd*
-      if (
-        money.uahMin == null &&
-        money.usdMin == null &&
-        (r.estimateUsdMin != null || r.estimateUahMin != null)
-      ) {
-        // already handled above
-      }
       return {
         work: String(r.work ?? r.action ?? "робота").trim(),
         kind,
         strategy: parseStrategy(r.strategy ?? r.approach),
+        decisionReason: String(
+          r.decisionReason ?? r.reason ?? r.why ?? ""
+        ).trim(),
+        alternative: String(r.alternative ?? r.alt ?? "").trim(),
         estimateUahMin: money.uahMin,
         estimateUahMax: money.uahMax,
         estimateUsdMin: money.usdMin,
@@ -447,6 +447,51 @@ export function parseDefectList(
       };
     })
     .filter((d) => d.work);
+}
+
+function sumDefectTotals(
+  defectList: DefectLine[],
+  fx: number
+): {
+  uahMin: number | null;
+  uahMax: number | null;
+  usdMin: number | null;
+  usdMax: number | null;
+} {
+  if (!defectList.length) {
+    return { uahMin: null, uahMax: null, usdMin: null, usdMax: null };
+  }
+  let uMin = 0;
+  let uMax = 0;
+  let dMin = 0;
+  let dMax = 0;
+  let anyU = false;
+  let anyD = false;
+  for (const d of defectList) {
+    if (d.estimateUahMin != null) {
+      uMin += d.estimateUahMin;
+      anyU = true;
+    }
+    if (d.estimateUahMax != null) {
+      uMax += d.estimateUahMax;
+      anyU = true;
+    }
+    if (d.estimateUsdMin != null) {
+      dMin += d.estimateUsdMin;
+      anyD = true;
+    }
+    if (d.estimateUsdMax != null) {
+      dMax += d.estimateUsdMax;
+      anyD = true;
+    }
+  }
+  return dualCurrency(
+    anyU ? uMin : null,
+    anyU ? uMax : null,
+    anyD ? dMin : null,
+    anyD ? dMax : null,
+    fx
+  );
 }
 
 export function parseHiddenWorkRisks(
@@ -530,119 +575,215 @@ export type DamageInventoryResult = {
   raw: unknown;
 };
 
+export type PhotoChatAnnotation = {
+  path: string;
+  index: number;
+  hasDamage: boolean;
+  /** Telegram caption (uk), max ~1000 chars */
+  caption: string;
+};
+
+function chunkPaths<T>(items: T[], size: number): T[][] {
+  return chunkArray(items, size);
+}
+
+/**
+ * Per-photo captions for Telegram: clean shots → «без пошкоджень»,
+ * damaged shots → short description of what is visible.
+ * Also builds inventory items from damaged photos.
+ */
+export async function annotatePhotosForChat(
+  imagePaths: string[],
+  context?: { lotId?: string; vin?: string | null }
+): Promise<{
+  annotations: PhotoChatAnnotation[];
+  inventory: DamageInventoryResult;
+}> {
+  const client = getClient();
+  const annotations: PhotoChatAnnotation[] = [];
+  const items: ObservedDamage[] = [];
+  const missedPossible: string[] = [];
+  const rawBatches: unknown[] = [];
+
+  const batches = chunkPaths(
+    imagePaths.map((path, index) => ({ path, index })),
+    4
+  );
+
+  for (const batch of batches) {
+    const images = await imageContents(
+      batch.map((b) => b.path),
+      "high"
+    );
+
+    try {
+      const completion = await client.chat.completions.create({
+        model: MODEL,
+        temperature: 0,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Ти інспектор кузова. Для КОЖНОГО фото (індекс 0..n-1 у цьому батчі) скажи, чи є видимі пошкодження. JSON only.\n" +
+              "Schema: {\n" +
+              '  "photos": [{\n' +
+              '    "index": 0,\n' +
+              '    "hasDamage": boolean,\n' +
+              '    "caption": "українською: якщо немає пошкоджень — коротко «Без пошкоджень» + що на кадрі (ракурс); якщо є — 1-3 речення що саме пошкоджено",\n' +
+              '    "damages": [{"area":"зона","description":"що видно","severity":"low|medium|high|critical","confidence":"low|medium|high"}]\n' +
+              "  }],\n" +
+              '  "missedPossible": ["сумнівне, не підтверджено"]\n' +
+              "}\n" +
+              "Правила: НЕ вигадуй пошкодження. hasDamage=false → damages=[]. caption для Telegram, до 900 символів. Українською.",
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text:
+                  `Лот: ${context?.lotId ?? "?"}. VIN: ${context?.vin ?? "?"}. ` +
+                  `Фото в батчі: ${batch.length} (index 0…${batch.length - 1}). Опиши кожне.`,
+              },
+              ...images,
+            ],
+          },
+        ],
+      });
+
+      const rawText = completion.choices[0]?.message?.content ?? "{}";
+      const parsed = extractJsonObject(rawText) as {
+        photos?: Array<{
+          index?: number;
+          hasDamage?: boolean;
+          caption?: string;
+          damages?: Array<{
+            area?: string;
+            description?: string;
+            severity?: string;
+            confidence?: string;
+          }>;
+        }>;
+        missedPossible?: string[];
+      };
+      rawBatches.push(parsed);
+
+      if (Array.isArray(parsed.missedPossible)) {
+        missedPossible.push(...parsed.missedPossible.map(String).filter(Boolean));
+      }
+
+      const byLocal = new Map<
+        number,
+        {
+          index?: number;
+          hasDamage?: boolean;
+          caption?: string;
+          damages?: Array<{
+            area?: string;
+            description?: string;
+            severity?: string;
+            confidence?: string;
+          }>;
+        }
+      >();
+      for (const row of parsed.photos ?? []) {
+        const li = Number(row.index);
+        if (Number.isInteger(li)) byLocal.set(li, row);
+      }
+
+      for (let li = 0; li < batch.length; li++) {
+        const global = batch[li];
+        const row = byLocal.get(li);
+        const hasDamage = Boolean(row?.hasDamage);
+        let caption = String(row?.caption ?? "").trim();
+        if (!caption) {
+          caption = hasDamage
+            ? "Є пошкодження (деталі не розпізнано)."
+            : "Без пошкоджень.";
+        }
+        if (!hasDamage && !/без пошкоджен/i.test(caption)) {
+          caption = `Без пошкоджень. ${caption}`.trim();
+        }
+        if (caption.length > 1000) caption = caption.slice(0, 997) + "…";
+
+        annotations.push({
+          path: global.path,
+          index: global.index,
+          hasDamage,
+          caption: `${global.index + 1}/${imagePaths.length}. ${caption}`,
+        });
+
+        if (hasDamage && Array.isArray(row?.damages)) {
+          for (const d of row.damages) {
+            const description = String(d.description ?? "").trim();
+            if (!description) continue;
+            const sev = String(d.severity ?? "medium").toLowerCase();
+            const conf = String(d.confidence ?? "medium").toLowerCase();
+            items.push({
+              area: String(d.area ?? "зона").trim(),
+              description,
+              severity:
+                sev === "critical" || sev === "high" || sev === "medium"
+                  ? sev
+                  : "low",
+              confidence:
+                conf === "high" || conf === "medium" ? conf : "low",
+              evidence: `фото ${global.index + 1}`,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("Photo annotation batch failed:", err);
+      for (const global of batch) {
+        annotations.push({
+          path: global.path,
+          index: global.index,
+          hasDamage: false,
+          caption: `${global.index + 1}/${imagePaths.length}. Не вдалося описати кадр.`,
+        });
+      }
+    }
+  }
+
+  // Ensure every path has annotation (order by index)
+  annotations.sort((a, b) => a.index - b.index);
+
+  return {
+    annotations,
+    inventory: {
+      photosAnalyzed: imagePaths.length,
+      items,
+      missedPossible: [...new Set(missedPossible)].slice(0, 10),
+      raw: { batches: rawBatches },
+    },
+  };
+}
+
 export function formatDamageInventory(
   inventory: DamageInventoryResult
 ): string {
   const lines: string[] = [];
   lines.push(
-    `Інвентар пошкоджень (ШІ переглянув ${inventory.photosAnalyzed} фото перед кошторисом):`
+    `Підсумок: ШІ переглянув ${inventory.photosAnalyzed} фото. Зафіксовано пунктів пошкоджень: ${inventory.items.length}.`
   );
-  if (!inventory.items.length) {
-    lines.push("• Явних пошкоджень на відібраних фото не зафіксовано (або кадри неінформативні).");
-  } else {
-    for (const [i, item] of inventory.items.slice(0, 20).entries()) {
-      lines.push(
-        `${i + 1}. ${item.area}: ${item.description} ` +
-          `[тяжкість: ${item.severity}, впевненість: ${item.confidence}]` +
-          (item.evidence ? ` — ${item.evidence}` : "")
-      );
-    }
-  }
   if (inventory.missedPossible.length) {
-    lines.push("");
-    lines.push("Можливо не видно / сумнівно (не включаю як факт):");
-    for (const m of inventory.missedPossible.slice(0, 8)) {
+    lines.push("Сумнівно / не підтверджено:");
+    for (const m of inventory.missedPossible.slice(0, 6)) {
       lines.push(`• ${m}`);
     }
   }
-  lines.push("");
-  lines.push(
-    "Перевір список: інколи ШІ може щось вигадати або пропустити. Далі рахую кошторис тільки по зафіксованому."
-  );
+  lines.push("Далі рахую кошторис по зафіксованому.");
   return lines.join("\n");
 }
 
+/** @deprecated use annotatePhotosForChat — kept for compatibility */
 export async function inventoryDamagesFromImages(
   imagePaths: string[],
   context?: { lotId?: string; vin?: string | null }
 ): Promise<DamageInventoryResult> {
-  const client = getClient();
-  const images = await imageContents(imagePaths, "high");
-
-  const completion = await client.chat.completions.create({
-    model: MODEL,
-    temperature: 0,
-    messages: [
-      {
-        role: "system",
-        content:
-          "Ти інспектор кузова. За фото Copart склади ТІЛЬКИ список видимих пошкоджень. Без цін. JSON only.\n" +
-          "Schema: {\n" +
-          '  "items": [{"area":"зона","description":"що саме видно","severity":"low|medium|high|critical","confidence":"low|medium|high","evidence":"на якому типі кадру видно"}],\n' +
-          '  "missedPossible": ["що могло б бути, але на цих фото НЕ підтверджено"]\n' +
-          "}\n" +
-          "Правила: НЕ вигадуй. Якщо невпевнено — confidence low або в missedPossible. " +
-          "Не дублюй одне й те саме. Українською.",
-      },
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text:
-              `Лот: ${context?.lotId ?? "?"}. VIN: ${context?.vin ?? "?"}. ` +
-              `Кількість фото в цьому запиті: ${imagePaths.length}. ` +
-              "Перелічи всі помічені пошкодження.",
-          },
-          ...images,
-        ],
-      },
-    ],
-  });
-
-  const rawText = completion.choices[0]?.message?.content ?? "{}";
-  const parsed = extractJsonObject(rawText) as {
-    items?: Array<{
-      area?: string;
-      description?: string;
-      severity?: string;
-      confidence?: string;
-      evidence?: string;
-    }>;
-    missedPossible?: string[];
-  };
-
-  const normSev = (s: string): ObservedDamage["severity"] => {
-    const v = s.toLowerCase();
-    if (v === "critical" || v === "high" || v === "medium") return v;
-    return "low";
-  };
-  const normConf = (s: string): ObservedDamage["confidence"] => {
-    const v = s.toLowerCase();
-    if (v === "high" || v === "medium") return v;
-    return "low";
-  };
-
-  const items: ObservedDamage[] = Array.isArray(parsed.items)
-    ? parsed.items
-        .map((it) => ({
-          area: String(it.area ?? "зона").trim(),
-          description: String(it.description ?? "").trim(),
-          severity: normSev(String(it.severity ?? "medium")),
-          confidence: normConf(String(it.confidence ?? "medium")),
-          evidence: String(it.evidence ?? "").trim(),
-        }))
-        .filter((it) => it.description)
-    : [];
-
-  return {
-    photosAnalyzed: imagePaths.length,
-    items,
-    missedPossible: Array.isArray(parsed.missedPossible)
-      ? parsed.missedPossible.map(String).filter(Boolean)
-      : [],
-    raw: parsed,
-  };
+  const { inventory } = await annotatePhotosForChat(imagePaths, context);
+  return inventory;
 }
 
 export async function analyzeDamageFromImages(
@@ -679,23 +820,24 @@ export async function analyzeDamageFromImages(
           "Спочатку врахуй переданий інвентар пошкоджень, потім склади дефектовку з цінами в USD і UAH. JSON only, no markdown.\n" +
           "Schema:\n" +
           "{\n" +
-          '  "summary": "короткий підсумок українською",\n' +
+          '  "summary": "2-4 речення: вердикт по лоту українською",\n' +
           '  "repairEstimateMinUsd": number|null,\n' +
           '  "repairEstimateMaxUsd": number|null,\n' +
           '  "repairEstimateMinUah": number|null,\n' +
           '  "repairEstimateMaxUah": number|null,\n' +
-          '  "defectList": [{"work":"що зробити","kind":"part|labor|both","strategy":"restore|replace_used_color|replace_new","estimateUsdMin":number|null,"estimateUsdMax":number|null,"estimateUahMin":number|null,"estimateUahMax":number|null,"notes":"string"}],\n' +
+          '  "defectList": [{"work":"що зробити","kind":"part|labor|both","strategy":"restore|replace_used_color|replace_new","decisionReason":"чому саме це рішення (порівняй з альтернативою)","alternative":"відхилена альтернатива коротко з орієнтовною ціною","estimateUsdMin":number|null,"estimateUsdMax":number|null,"estimateUahMin":number|null,"estimateUahMax":number|null,"notes":"string"}],\n' +
           '  "hiddenWorkRisks": [{"area":"зона","probabilityPercent":0-100,"why":"string","possibleExtraUsdMin":number|null,"possibleExtraUsdMax":number|null,"possibleExtraUahMin":number|null,"possibleExtraUahMax":number|null}],\n' +
           '  "damageZones": [{"zone":"string","severity":"low|medium|high|critical","notes":"string"}],\n' +
           '  "confidence": "low|medium|high",\n' +
           '  "limitations": ["string"]\n' +
           "}\n" +
-          "ПРАВИЛА РІШЕННЯ (strategy):\n" +
-          "1) restore — якщо деталь реально відновити і це ВИГІДНІШЕ за заміну.\n" +
-          "2) replace_used_color — під заміну: є місяці до прибуття авто, рахуй Б/У У КОЛЬОРІ + установку.\n" +
-          "3) replace_new — лише якщо б/у майже нереальний або критична безпека.\n" +
-          "Не роздувай кошторис пошкодженнями, яких немає в інвентарі, якщо їх не видно явно на фото. " +
-          `Курс ~${fx} грн/$. Суми defectList ≈ totals. Ризики = % прихованих додаткових робіт.`,
+          "ПРАВИЛА РІШЕННЯ (strategy) — ОБОВʼЯЗКОВО обґрунтуй у decisionReason:\n" +
+          "1) restore — якщо відновлення реальне і ДЕШЕВШЕ/порівнянне з заміною; у decisionReason порівняй з ціною заміни.\n" +
+          "2) replace_used_color — під заміну: є місяці до прибуття, б/у в колір; укажи чому не відновлювати (тріщина кріплення, геометрія, час/якість).\n" +
+          "3) replace_new — лише safety/ркість б/у; обґрунтуй.\n" +
+          "alternative = що відхилили (напр. «відновлення ~$180» або «нова OEM ~$900»). " +
+          "Не роздувай кошторис поза інвентарем. " +
+          `Курс ~${fx} грн/$. totals ≈ сума defectList. Ризики = % прихованих додаткових робіт.`,
       },
       {
         role: "user",
@@ -749,13 +891,21 @@ export async function analyzeDamageFromImages(
     }));
   }
 
-  const totals = dualCurrency(
+  const fromAi = dualCurrency(
     roundMoney(parsed.repairEstimateMinUah),
     roundMoney(parsed.repairEstimateMaxUah),
     roundMoney(parsed.repairEstimateMinUsd),
     roundMoney(parsed.repairEstimateMaxUsd),
     fx
   );
+  const fromLines = sumDefectTotals(defectList, fx);
+  // Prefer explicit AI totals; fall back / fill gaps from sum of defect lines
+  const totals = {
+    uahMin: fromAi.uahMin ?? fromLines.uahMin,
+    uahMax: fromAi.uahMax ?? fromLines.uahMax,
+    usdMin: fromAi.usdMin ?? fromLines.usdMin,
+    usdMax: fromAi.usdMax ?? fromLines.usdMax,
+  };
 
   return {
     summary: parsed.summary?.trim() || "Аналіз пошкоджень недоступний.",
@@ -803,43 +953,33 @@ export function formatDamageReport(
   }
 ): string {
   const lines: string[] = [];
-  lines.push("Аналіз лота");
+  const sep = "────────────";
+
+  lines.push("📋 ЗВІТ ПО ЛОТУ");
+  lines.push(sep);
   if (vin) {
     lines.push(`VIN: ${vin}`);
   } else {
     lines.push(
       `VIN: не прочитано` +
         (meta?.vinReason ? ` (${meta.vinReason})` : "") +
-        ". Перевірте табличку вручну в галереї лота."
+        " — перевірте табличку вручну."
     );
   }
-
   if (meta?.totalPhotos != null) {
     lines.push(
-      `Фото: ${meta.totalPhotos} у ZIP` +
-        (meta.vinCandidates != null ? `, VIN-кандидати: ${meta.vinCandidates}` : "") +
-        (meta.damagePhotos != null ? `, на damage: ${meta.damagePhotos}` : "")
+      `Фото в ZIP: ${meta.totalPhotos} · ШІ на damage: ${analysis.photosAnalyzed}` +
+        (meta.vinCandidates != null ? ` · VIN-кадри: ${meta.vinCandidates}` : "")
     );
+  } else {
+    lines.push(`ШІ проаналізував ${analysis.photosAnalyzed} фото (damage).`);
   }
+  lines.push(`Впевненість: ${analysis.confidence}`);
+  lines.push(`Ринок: СТО Україна · курс ~${analysis.fxUahPerUsd} грн/$`);
 
-  lines.push(`Впевненість оцінки: ${analysis.confidence}`);
-  lines.push(
-    `ШІ проаналізував ${analysis.photosAnalyzed} фото для оцінки пошкоджень.`
-  );
-  lines.push(
-    `Ринок: Україна (СТО). Курс орієнтир ~${analysis.fxUahPerUsd} грн/$. Логіка: відновлення якщо вигідно, інакше б/у в колір (є місяці до прибуття авто).`
-  );
-
-  if (analysis.observedDamages.length) {
-    lines.push("");
-    lines.push("Зафіксовані пошкодження (до кошторису):");
-    for (const [i, item] of analysis.observedDamages.slice(0, 16).entries()) {
-      lines.push(
-        `${i + 1}. ${item.area}: ${item.description} [${item.severity}/${item.confidence}]`
-      );
-    }
-  }
-
+  lines.push("");
+  lines.push("💰 ЗАГАЛЬНА ВАРТІСТЬ РЕМОНТУ (видиме)");
+  lines.push(sep);
   if (
     analysis.repairEstimateMin != null ||
     analysis.repairEstimateMax != null ||
@@ -847,57 +987,78 @@ export function formatDamageReport(
     analysis.repairEstimateMaxUsd != null
   ) {
     lines.push(
-      `Орієнтовний ремонт (видиме): ${formatMoneyRange(
+      formatMoneyRange(
         analysis.repairEstimateMin,
         analysis.repairEstimateMax,
         analysis.repairEstimateMinUsd,
         analysis.repairEstimateMaxUsd
-      )}`
+      )
     );
+  } else {
+    lines.push("немає даних");
   }
 
-  lines.push("");
-  lines.push(analysis.summary);
+  if (analysis.summary) {
+    lines.push("");
+    lines.push("📝 Висновок");
+    lines.push(sep);
+    lines.push(analysis.summary);
+  }
+
+  if (analysis.observedDamages.length) {
+    lines.push("");
+    lines.push("🔍 Що видно на фото");
+    lines.push(sep);
+    for (const [i, item] of analysis.observedDamages.slice(0, 14).entries()) {
+      lines.push(
+        `${i + 1}. ${item.area} — ${item.description} (${item.severity})`
+      );
+    }
+  }
 
   if (analysis.defectList.length) {
     lines.push("");
-    lines.push("Дефектовка (що робити + ціни $ / грн):");
-    for (const d of analysis.defectList.slice(0, 16)) {
+    lines.push("🔧 Дефектовка: рішення і ціни");
+    lines.push(sep);
+    for (const [i, d] of analysis.defectList.slice(0, 16).entries()) {
       const kind =
         d.kind === "part"
           ? "запчастина"
           : d.kind === "labor"
             ? "робота"
             : "запч.+робота";
+      lines.push(`${i + 1}. ${d.work}`);
       lines.push(
-        `• ${d.work} [${kind}, ${strategyLabel(d.strategy)}]: ${formatMoneyRange(
+        `   Рішення: ${strategyLabel(d.strategy)} (${kind}) · ${formatMoneyRange(
           d.estimateUahMin,
           d.estimateUahMax,
           d.estimateUsdMin,
           d.estimateUsdMax
-        )}${d.notes ? ` — ${d.notes}` : ""}`
+        )}`
       );
-    }
-  }
-
-  if (analysis.damageZones.length) {
-    lines.push("");
-    lines.push("Зони пошкоджень:");
-    for (const z of analysis.damageZones.slice(0, 10)) {
-      lines.push(`• ${z.zone} (${z.severity})${z.notes ? `: ${z.notes}` : ""}`);
+      if (d.decisionReason) {
+        lines.push(`   Чому: ${d.decisionReason}`);
+      }
+      if (d.alternative) {
+        lines.push(`   Альтернатива (відхилено): ${d.alternative}`);
+      }
+      if (d.notes) {
+        lines.push(`   Примітка: ${d.notes}`);
+      }
+      lines.push("");
     }
   }
 
   if (analysis.hiddenWorkRisks.length) {
-    lines.push("");
-    lines.push("Ризики прихованих робіт (імовірність %):");
-    for (const r of analysis.hiddenWorkRisks.slice(0, 12)) {
+    lines.push("⚠️ Ризики прихованих робіт");
+    lines.push(sep);
+    for (const r of analysis.hiddenWorkRisks.slice(0, 10)) {
       const extra =
         r.possibleExtraUsdMin != null ||
         r.possibleExtraUahMin != null ||
         r.possibleExtraUsdMax != null ||
         r.possibleExtraUahMax != null
-          ? ` | можливий плюс ${formatMoneyRange(
+          ? ` · можливий плюс ${formatMoneyRange(
               r.possibleExtraUahMin,
               r.possibleExtraUahMax,
               r.possibleExtraUsdMin,
@@ -908,26 +1069,22 @@ export function formatDamageReport(
         `• ${r.area}: ${r.probabilityPercent}%${r.why ? ` — ${r.why}` : ""}${extra}`
       );
     }
-  } else if (analysis.risks.length) {
-    lines.push("");
-    lines.push("Ризики прихованих робіт:");
-    for (const r of analysis.risks.slice(0, 10)) {
-      lines.push(`• ${r}`);
-    }
   }
 
   if (analysis.limitations.length) {
     lines.push("");
-    lines.push("Обмеження (не видно на фото):");
-    for (const l of analysis.limitations.slice(0, 8)) {
+    lines.push("ℹ️ Не видно на фото / обмеження");
+    lines.push(sep);
+    for (const l of analysis.limitations.slice(0, 6)) {
       lines.push(`• ${l}`);
     }
   }
 
   lines.push("");
+  lines.push(sep);
   lines.push(
-    "Оцінка приблизна: $ і грн для українського СТО; б/у в колір з урахуванням часу доставки авто."
+    "Орієнтир для українського СТО: відновлення якщо вигідно, інакше б/у в колір (є час до прибуття авто)."
   );
-  lines.push("Повторний повний аналіз: додайте слово force до повідомлення з посиланням.");
+  lines.push("Повторний повний аналіз: додайте force до повідомлення з посиланням.");
   return lines.join("\n");
 }

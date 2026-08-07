@@ -7,25 +7,47 @@ import { normalizeVin } from "../lib/ai";
 import { prisma } from "../lib/prisma";
 import { processLotFromMessage } from "../lib/pipeline";
 
-dotenv.config({ path: path.resolve(process.cwd(), ".env") });
-dotenv.config({ path: path.resolve(process.cwd(), ".env.local") });
+const envPath = path.resolve(process.cwd(), ".env");
+const envLocalPath = path.resolve(process.cwd(), ".env.local");
+const loaded = dotenv.config({ path: envPath, override: true });
+dotenv.config({ path: envLocalPath, override: true });
+
+if (loaded.error) {
+  console.warn(
+    `[env] не вдалося прочитати ${envPath} (cwd=${process.cwd()}):`,
+    loaded.error.message
+  );
+} else {
+  console.log(
+    `[env] завантажено ${envPath}, ключів у файлі: ${Object.keys(loaded.parsed ?? {}).length}`
+  );
+}
 
 process.env.NTBA_FIX_319 = "1";
 process.env.NTBA_FIX_350 = "1";
 
-const token = process.env.TELEGRAM_BOT_TOKEN;
+function envSet(name: string): boolean {
+  return Boolean(process.env[name]?.trim());
+}
+
+const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
 if (!token) {
   console.error("TELEGRAM_BOT_TOKEN is not set");
   process.exit(1);
 }
-if (!process.env.DATABASE_URL) {
+if (!envSet("DATABASE_URL")) {
   console.error("DATABASE_URL is not set");
   process.exit(1);
 }
-if (!process.env.OPENAI_API_KEY) {
+if (!envSet("OPENAI_API_KEY")) {
   console.error("OPENAI_API_KEY is not set");
   process.exit(1);
 }
+
+console.log(
+  `[env] VINREPORT_API_KEY=${envSet("VINREPORT_API_KEY") ? "ok" : "MISSING"}, ` +
+    `VINREPORT_USER_ID=${envSet("VINREPORT_USER_ID") ? "ok" : "MISSING"}`
+);
 
 const bot = new TelegramBot(token, { polling: true });
 
@@ -106,10 +128,14 @@ bot.on("callback_query", async (query) => {
       return;
     }
 
-    if (!process.env.VINREPORT_API_KEY || !process.env.VINREPORT_USER_ID) {
+    if (!envSet("VINREPORT_API_KEY") || !envSet("VINREPORT_USER_ID")) {
       await sendText(
         chatId,
-        "Carfax API ще не налаштований. Додайте VINREPORT_API_KEY і VINREPORT_USER_ID у .env."
+        "Carfax API ще не налаштований у процесі бота.\n" +
+          "Перевірте на сервері файл .env (не .env.example):\n" +
+          "VINREPORT_API_KEY=...\n" +
+          "VINREPORT_USER_ID=...\n" +
+          "Потім: pm2 restart copart-bot і в логах має бути VINREPORT_...=ok"
       );
       return;
     }
@@ -126,7 +152,7 @@ bot.on("callback_query", async (query) => {
       });
     }
 
-    await sendText(chatId, `Аналіз Carfax:\n\n${result.carfaxAnalysis}`);
+    await sendText(chatId, result.carfaxAnalysis);
 
     if (result.stickerPath && fs.existsSync(result.stickerPath)) {
       const isPdf = result.stickerPath.toLowerCase().endsWith(".pdf");
@@ -140,10 +166,7 @@ bot.on("callback_query", async (query) => {
         });
       }
       if (result.stickerAnalysis) {
-        await sendText(
-          chatId,
-          `Аналіз Window Sticker:\n\n${result.stickerAnalysis}`
-        );
+        await sendText(chatId, result.stickerAnalysis);
       }
     } else if (result.stickerNote) {
       await sendText(chatId, result.stickerNote);
@@ -211,6 +234,20 @@ bot.on("message", async (msg) => {
       telegramId,
       username,
       onProgress: async (p) => {
+        if (p.stage === "photo" && p.photoPath) {
+          try {
+            if (fs.existsSync(p.photoPath)) {
+              await bot.sendPhoto(chatId, p.photoPath, {
+                caption: p.message.slice(0, 1024),
+              });
+            } else {
+              await sendText(chatId, p.message);
+            }
+          } catch {
+            await sendText(chatId, p.message);
+          }
+          return;
+        }
         if (p.stage === "cached" && p.report) {
           await sendText(chatId, p.message);
           await sendText(chatId, p.report);

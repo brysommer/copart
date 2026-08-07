@@ -1,10 +1,10 @@
 import { ImageRole, LotStatus, Prisma } from "@prisma/client";
 import {
   analyzeDamageFromImages,
+  annotatePhotosForChat,
   extractVinFromImages,
   formatDamageInventory,
   formatDamageReport,
-  inventoryDamagesFromImages,
   parseDefectList,
   parseHiddenWorkRisks,
   selectDamageCandidates,
@@ -31,6 +31,7 @@ export type PipelineProgress = {
     | "triage"
     | "vin"
     | "inventory"
+    | "photo"
     | "damage"
     | "done"
     | "cached"
@@ -38,6 +39,8 @@ export type PipelineProgress = {
   message: string;
   vin?: string | null;
   report?: string;
+  /** Local path to send as Telegram photo */
+  photoPath?: string;
 };
 
 export type PipelineResult = {
@@ -395,13 +398,21 @@ export async function processLot(options: {
 
     await notify({
       stage: "inventory",
-      message: `ШІ переглядає ${damagePhotos.length} фото для списку пошкоджень (ще без цін)...`,
+      message: `Переглядаю ${damagePhotos.length} фото по одному: скину в чат з описом (або «без пошкоджень»)...`,
     });
 
-    const inventory = await inventoryDamagesFromImages(damagePhotos, {
-      lotId,
-      vin,
-    });
+    const { annotations, inventory } = await annotatePhotosForChat(
+      damagePhotos,
+      { lotId, vin }
+    );
+
+    for (const photo of annotations) {
+      await notify({
+        stage: "photo",
+        message: photo.caption,
+        photoPath: photo.path,
+      });
+    }
 
     await notify({
       stage: "inventory",
@@ -410,7 +421,7 @@ export async function processLot(options: {
 
     await notify({
       stage: "damage",
-      message: `Рахую кошторис по ${inventory.items.length} зафіксованих пунктах на основі ${damagePhotos.length} фото...`,
+      message: `Рахую кошторис по ${inventory.items.length} зафіксованих пунктах (${damagePhotos.length} фото)...`,
     });
 
     const analysis = await analyzeDamageFromImages(damagePhotos, {
