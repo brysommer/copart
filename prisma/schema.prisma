@@ -1,0 +1,86 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum LotStatus {
+  PENDING
+  DOWNLOADING
+  ANALYZING
+  DONE
+  FAILED
+}
+
+enum ImageRole {
+  UNKNOWN
+  VIN_PLATE
+  DAMAGE
+  OTHER
+}
+
+model User {
+  id         String   @id @default(cuid())
+  telegramId String   @unique
+  username   String?
+  createdAt  DateTime @default(now())
+  lots       Lot[]
+}
+
+model Lot {
+  id        String         @id @default(cuid())
+  lotId     String         @unique
+  url       String
+  vin       String?
+  status    LotStatus      @default(PENDING)
+  error     String?
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+  userId    String?
+  user      User?          @relation(fields: [userId], references: [id])
+  images    LotImage[]
+  analysis  LotAnalysis?
+  carfaxReports CarfaxReport[]
+}
+
+model CarfaxReport {
+  id              String   @id @default(cuid())
+  lotId           String?
+  lot             Lot?     @relation(fields: [lotId], references: [id], onDelete: SetNull)
+  vin             String   @unique
+  pdfPath         String?
+  stickerPath     String?
+  carfaxAnalysis  String?
+  stickerAnalysis String?
+  rawMeta         Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model LotAnalysis {
+  id                 String   @id @default(cuid())
+  lotId              String   @unique
+  lot                Lot      @relation(fields: [lotId], references: [id], onDelete: Cascade)
+  repairEstimateMin  Int?
+  repairEstimateMax  Int?
+  risks              Json
+  summary            String
+  damageZones        Json?
+  rawAiResponse      Json
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+model LotImage {
+  id        String    @id @default(cuid())
+  lotId     String
+  lot       Lot       @relation(fields: [lotId], references: [id], onDelete: Cascade)
+  path      String
+  role      ImageRole @default(UNKNOWN)
+  createdAt DateTime  @default(now())
+
+  @@index([lotId])
+}
