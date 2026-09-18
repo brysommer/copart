@@ -196,7 +196,7 @@ export async function publishLinkedInPost(text: string): Promise<void> {
     }
 
     if (!opened) {
-      await page.goto("https://www.linkedin.com/feed/?shareActive=true", {
+      await page.goto("https://www.linkedin.com/sharing/compose", {
         waitUntil: "domcontentloaded",
         timeout: 60_000,
       });
@@ -205,7 +205,7 @@ export async function publishLinkedInPost(text: string): Promise<void> {
 
     const editor = page
       .locator(
-        '.share-creation-state .ql-editor, .ql-editor, div[role="textbox"][data-test-ql-editor-contenteditable="true"], .share-creation-state div[contenteditable="true"], div.ProseMirror'
+        '[role="dialog"] [contenteditable="true"], .ql-editor, div[role="textbox"][contenteditable="true"], div.ProseMirror, div[contenteditable="true"]'
       )
       .first();
     await editor.waitFor({ state: "visible", timeout: 20_000 });
@@ -214,12 +214,11 @@ export async function publishLinkedInPost(text: string): Promise<void> {
     await page.keyboard.type(body, { delay: randomDelayMs(15, 45) });
     await humanPause(1500, 3000);
 
-    const postBtn = page
-      .locator(".share-creation-state")
-      .locator(
-        'button.share-actions__primary-action, button[aria-label="Post"], button:has-text("Опублікувати"), button:has-text("Post")'
-      )
-      .last();
+    const dialog = page.getByRole("dialog");
+    const postBtn = dialog
+      .getByRole("button", { name: /^(Post|Опублікувати)$/ })
+      .or(page.getByRole("button", { name: /^(Post|Опублікувати)$/ }))
+      .first();
     await postBtn.waitFor({ state: "visible", timeout: 15_000 });
     if (await postBtn.isDisabled().catch(() => false)) {
       await editor.click();
