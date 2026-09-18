@@ -158,54 +158,70 @@ export async function publishLinkedInPost(text: string): Promise<void> {
 
   await withLinkedInPage("publish", async (page) => {
     await ensureLinkedInLoggedIn(page);
-    await humanPause(1000, 2000);
+    await page
+      .locator(".scaffold-layout__main, .share-box-feed-entry, main")
+      .first()
+      .waitFor({ state: "visible", timeout: 30_000 })
+      .catch(() => undefined);
+    await humanPause(1500, 3000);
 
-    // Open composer
-    const startSelectors = [
-      'button:has-text("Start a post")',
-      'button:has-text("Створити допис")',
-      'button:has-text("Start a post")',
-      '.share-box-feed-entry__trigger',
-      'button.artdeco-button--secondary:has-text("Post")',
+    const dismiss = page.locator(
+      'button[aria-label="Dismiss"], button[aria-label="Dismiss reminder"], button:has-text("Not now"), button:has-text("Skip"), button:has-text("Пізніше"), button:has-text("Пропустити")'
+    );
+    if (await dismiss.first().isVisible({ timeout: 800 }).catch(() => false)) {
+      await dismiss.first().click().catch(() => undefined);
+    }
+
+    const startLocators = [
+      page.getByRole("button", {
+        name: /start a post|draft with ai|почніть публікац|почніть допис|створити допис|створити публікац|написати допис|почати публікац/i,
+      }),
+      page.locator(
+        'button[data-test-id="share-box-feed-entry__trigger"], [data-test-id="share-box-feed-entry__trigger"]'
+      ),
+      page.locator(
+        "button.share-box-feed-entry__trigger, .share-box-feed-entry__trigger, .share-box-feed-entry__top-bar"
+      ),
+      page.locator(".share-box-feed-entry"),
     ];
+
     let opened = false;
-    for (const sel of startSelectors) {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
-        await el.click();
+    for (const loc of startLocators) {
+      const el = loc.first();
+      if (await el.isVisible({ timeout: 4000 }).catch(() => false)) {
+        await el.click({ timeout: 10_000 });
         opened = true;
         break;
       }
     }
+
     if (!opened) {
-      // click the share box area
-      const box = page.locator(".share-box-feed-entry__avatar, .share-box-feed-entry").first();
-      if (await box.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await box.click();
-        opened = true;
-      }
-    }
-    if (!opened) {
-      throw new Error("Не знайшов кнопку «Start a post» на LinkedIn feed");
+      await page.goto("https://www.linkedin.com/feed/?shareActive=true", {
+        waitUntil: "domcontentloaded",
+        timeout: 60_000,
+      });
+      await humanPause(1500, 3000);
     }
 
-    await humanPause(1000, 2000);
-
-    const editor = page.locator(
-      '.ql-editor, div[role="textbox"][data-test-ql-editor-contenteditable="true"], div.ProseMirror, div[contenteditable="true"]'
-    ).first();
+    const editor = page
+      .locator(
+        '.share-creation-state .ql-editor, .ql-editor, div[role="textbox"][data-test-ql-editor-contenteditable="true"], .share-creation-state div[contenteditable="true"], div.ProseMirror'
+      )
+      .first();
     await editor.waitFor({ state: "visible", timeout: 20_000 });
     await editor.click();
     await humanPause(400, 900);
     await page.keyboard.type(body, { delay: randomDelayMs(15, 45) });
     await humanPause(1500, 3000);
 
-    const postBtn = page.locator(
-      'button:has-text("Post"):not(:has-text("Start")), button:has-text("Опублікувати"), button.share-actions__primary-action'
-    ).last();
+    const postBtn = page
+      .locator(".share-creation-state")
+      .locator(
+        'button.share-actions__primary-action, button[aria-label="Post"], button:has-text("Опублікувати"), button:has-text("Post")'
+      )
+      .last();
     await postBtn.waitFor({ state: "visible", timeout: 15_000 });
     if (await postBtn.isDisabled().catch(() => false)) {
-      // try enable by clicking editor again
       await editor.click();
       await humanPause(500, 1000);
     }
