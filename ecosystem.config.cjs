@@ -32,6 +32,13 @@ module.exports = {
         STORAGE_DIR: process.env.STORAGE_DIR || "./storage",
         COPART_COOKIE: process.env.COPART_COOKIE || "",
         COPART_USER_AGENT: process.env.COPART_USER_AGENT || "",
+        COPART_XSRF_TOKEN: process.env.COPART_XSRF_TOKEN || "",
+        IAAI_COOKIE: process.env.IAAI_COOKIE || "",
+        IAAI_USER_AGENT: process.env.IAAI_USER_AGENT || "",
+        AUCTION_USE_BROWSER: process.env.AUCTION_USE_BROWSER || "1",
+        BROWSER_HEADLESS: process.env.BROWSER_HEADLESS || "0",
+        BROWSER_USER_DATA_DIR: process.env.BROWSER_USER_DATA_DIR || "",
+
         VINREPORT_API_KEY: process.env.VINREPORT_API_KEY || "",
         VINREPORT_USER_ID: process.env.VINREPORT_USER_ID || "",
         VINREPORT_BASE_URL: process.env.VINREPORT_BASE_URL || "",

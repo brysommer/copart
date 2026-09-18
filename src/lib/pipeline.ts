@@ -20,7 +20,16 @@ import {
   parseLotUrl,
   type ParsedLotUrl,
 } from "./copart";
+import {
+  downloadIaaiImagesZip,
+  IaaiDownloadError,
+  parseIaaiUrl,
+  type ParsedIaaiLot,
+} from "./iaai";
 import { prisma } from "./prisma";
+import { useBrowserDownloads } from "./browser";
+
+export type ParsedAuctionLot = ParsedLotUrl | ParsedIaaiLot;
 
 const processingLots = new Set<string>();
 
@@ -239,10 +248,13 @@ export async function processLotFromMessage(options: {
   username?: string;
   onProgress?: (p: PipelineProgress) => Promise<void> | void;
 }): Promise<PipelineResult> {
-  const parsed = parseLotUrl(options.text);
+  const parsed =
+    parseIaaiUrl(options.text) || parseLotUrl(options.text);
   if (!parsed) {
     throw new Error(
-      "Надішліть посилання Copart виду:\nhttps://www.copart.com/lot/57493376/salvage-...\n\n" +
+      "Надішліть посилання Copart або IAAI, наприклад:\n" +
+        "https://www.copart.com/lot/57493376/salvage-...\n" +
+        "https://www.iaai.com/VehicleDetail/45437769~US\n\n" +
         "Для повторного аналізу додайте слово force."
     );
   }
@@ -257,7 +269,7 @@ export async function processLotFromMessage(options: {
 }
 
 export async function processLot(options: {
-  parsed: ParsedLotUrl;
+  parsed: ParsedAuctionLot;
   telegramId: string;
   username?: string;
   force?: boolean;
@@ -299,13 +311,26 @@ export async function processLot(options: {
     };
   }
 
-  if (
-    processingLots.has(lotId) ||
-    (!force &&
-      (existing?.status === LotStatus.DOWNLOADING ||
-        existing?.status === LotStatus.ANALYZING))
-  ) {
-    throw new Error(`Лот ${lotId} уже в обробці. Зачекайте.`);
+  if (processingLots.has(lotId)) {
+    throw new Error(
+      `Лот ${lotId} уже в обробці зараз. Зачекайте або надішліть з force.`
+    );
+  }
+
+  // After a crash DB can stay DOWNLOADING forever — allow retry if stale.
+  const staleMs = 5 * 60 * 1000;
+  const dbBusy =
+    existing?.status === LotStatus.DOWNLOADING ||
+    existing?.status === LotStatus.ANALYZING;
+  const staleBusy =
+    dbBusy &&
+    existing?.updatedAt != null &&
+    Date.now() - existing.updatedAt.getTime() > staleMs;
+
+  if (!force && dbBusy && !staleBusy) {
+    throw new Error(
+      `Лот ${lotId} уже в обробці. Зачекайте або надішліть посилання з словом force.`
+    );
   }
 
   processingLots.add(lotId);
@@ -332,17 +357,26 @@ export async function processLot(options: {
       },
     });
 
+    const sourceLabel = parsed.source === "iaai" ? "IAAI" : "Copart";
     await notify({
       stage: "download",
-      message: `Завантажую фото лота ${lotId}${force ? " (force)" : ""}...`,
+      message:
+        `Завантажую фото ${sourceLabel} ${lotId}` +
+        (useBrowserDownloads() ? " через Chrome" : "") +
+        (force ? " (force)" : "") +
+        "...",
     });
 
     let imagePaths: string[];
     try {
-      ({ imagePaths } = await downloadLotImagesZip(lotId));
+      if (parsed.source === "iaai") {
+        ({ imagePaths } = await downloadIaaiImagesZip(parsed));
+      } else {
+        ({ imagePaths } = await downloadLotImagesZip(lotId));
+      }
     } catch (err) {
       const message =
-        err instanceof CopartDownloadError
+        err instanceof CopartDownloadError || err instanceof IaaiDownloadError
           ? err.message
           : `Не вдалося завантажити фото лота ${lotId}.`;
       await prisma.lot.update({

@@ -4,10 +4,7 @@ import {
   extractPdfText,
 } from "./carfax-ai";
 import { downloadCarfaxPdf, VinReportError } from "./vinreport";
-import {
-  tryDownloadWindowSticker,
-  tryStickerFromCarfaxLinks,
-} from "./window-sticker";
+import { tryStickerFromCarfaxLinks } from "./window-sticker";
 
 export type CarfaxBundleResult = {
   pdfPath: string;
@@ -29,34 +26,45 @@ export async function purchaseAndAnalyzeCarfax(
   const carfaxAnalysis = await analyzeCarfaxText(vin, pdfText);
 
   await onStatus?.(
-    "Шукаю Window Sticker (з сервера; з UA IP часто блокується)..."
+    "Шукаю Window Sticker у Carfax (клікабельні PDF-лінки + текст)..."
   );
 
-  let sticker =
-    (await tryDownloadWindowSticker(vin)) ||
-    (await tryStickerFromCarfaxLinks(vin, pdfText));
+  const stickerResult = await tryStickerFromCarfaxLinks(
+    vin,
+    pdfText,
+    pdfPath
+  );
 
+  let stickerPath: string | null = null;
   let stickerAnalysis: string | null = null;
   let stickerNote: string | undefined;
 
-  if (sticker) {
-    await onStatus?.("Знайшов sticker — аналізую...");
+  if (stickerResult.status === "ok") {
+    stickerPath = stickerResult.path;
+    await onStatus?.(
+      `Знайшов посилання в Carfax — завантажив sticker:\n${stickerResult.sourceUrl}`
+    );
     try {
-      stickerAnalysis = await analyzeWindowStickerFile(vin, sticker.path);
+      stickerAnalysis = await analyzeWindowStickerFile(vin, stickerResult.path);
     } catch (err) {
       stickerNote =
         err instanceof Error
           ? `Sticker скачано, але аналіз не вдався: ${err.message}`
           : "Sticker скачано, але аналіз не вдався.";
     }
+  } else if (stickerResult.status === "no_links") {
+    stickerNote =
+      "У Carfax немає посилання на Window Sticker (ні в тексті, ні в клікабельних лінках PDF).";
   } else {
     stickerNote =
-      "Window Sticker не вдалося завантажити (geo-блок або немає для VIN). Спробуйте з VPS у DE/US.";
+      "У Carfax є посилання на Window Sticker, але завантажити не вдалося.\n" +
+      stickerResult.urls.map((u) => `• ${u}`).join("\n") +
+      `\nДеталі: ${stickerResult.detail}`;
   }
 
   return {
     pdfPath,
-    stickerPath: sticker?.path ?? null,
+    stickerPath,
     carfaxAnalysis,
     stickerAnalysis,
     balance,

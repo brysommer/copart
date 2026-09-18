@@ -6,6 +6,21 @@ import { purchaseAndAnalyzeCarfax, VinReportError } from "../lib/carfax-service"
 import { normalizeVin } from "../lib/ai";
 import { prisma } from "../lib/prisma";
 import { processLotFromMessage } from "../lib/pipeline";
+import { getTodayLogPath, log } from "../lib/logger";
+import { useBrowserDownloads } from "../lib/browser";
+import {
+  linkedInEnabled,
+  linkedInOwnerChatId,
+} from "../lib/linkedin-browser";
+import {
+  formatLinkedInStatus,
+  generateAndOfferPost,
+  handleDraftDecision,
+  runFollowTick,
+  startLinkedInScheduler,
+  ensureLinkedInSchedule,
+} from "../lib/linkedin-scheduler";
+import { loadLinkedInState } from "../lib/linkedin-state";
 
 const envPath = path.resolve(process.cwd(), ".env");
 const envLocalPath = path.resolve(process.cwd(), ".env.local");
@@ -55,11 +70,54 @@ const bot = new TelegramBot(token, { polling: true });
 const lastVinByChat = new Map<number, { vin: string; lotId?: string }>();
 
 const START_TEXT =
-  "Надішліть посилання на лот Copart, наприклад:\n" +
-  "https://www.copart.com/lot/57493376/salvage-2022-ford-edge-sel-ca-bakersfield\n\n" +
+  "Надішліть посилання на лот Copart або IAAI, наприклад:\n" +
+  "https://www.copart.com/lot/57493376/salvage-...\n" +
+  "https://www.iaai.com/VehicleDetail/45437769~US\n\n" +
   "Я завантажу фото, прочитаю VIN, зроблю інвентар пошкоджень і кошторис.\n" +
   "Після аналізу запропоную купити Carfax (VinReport).\n" +
-  "Повторний аналіз лота: додайте слово force.";
+  "Повторний аналіз лота: додайте слово force.\n\n" +
+  "LinkedIn: /li_status · /li_post · /li_follow\n" +
+  "Чернетка поста: ТАК / НІ / або промпт на нову версію.";
+
+function isLinkedInOwner(chatId: number): boolean {
+  const owner = linkedInOwnerChatId();
+  return owner != null && chatId === owner;
+}
+
+async function linkedInNotify(
+  chatId: number,
+  text: string,
+  opts?: { withDraftButtons?: boolean }
+) {
+  if (opts?.withDraftButtons) {
+    await bot.sendMessage(chatId, text, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ ТАК — опублікувати", callback_data: "li:post:yes" },
+            { text: "❌ НІ — скіп", callback_data: "li:post:no" },
+          ],
+        ],
+      },
+    });
+    return;
+  }
+  await sendText(chatId, text);
+}
+
+function parseYesNo(text: string): "yes" | "no" | null {
+  const t = text.trim().toLowerCase();
+  if (
+    /^(так|yes|ok|ок|да|publish|опублікуй|опублікувати)$/i.test(t) ||
+    t === "✅"
+  ) {
+    return "yes";
+  }
+  if (/^(ні|нет|no|skip|скіп)$/i.test(t) || t === "❌") {
+    return "no";
+  }
+  return null;
+}
 
 async function sendText(chatId: number, text: string) {
   const chunks: string[] = [];
@@ -114,6 +172,19 @@ bot.on("callback_query", async (query) => {
 
   try {
     await bot.answerCallbackQuery(query.id);
+
+    if (data === "li:post:yes" || data === "li:post:no") {
+      if (!isLinkedInOwner(chatId)) {
+        await sendText(chatId, "LinkedIn-команда лише для власника.");
+        return;
+      }
+      await handleDraftDecision(
+        (t, o) => linkedInNotify(chatId, t, o),
+        chatId,
+        data === "li:post:yes" ? "yes" : "no"
+      );
+      return;
+    }
 
     if (data.startsWith("carfax:no:")) {
       await sendText(chatId, "Ок, без Carfax.");
@@ -216,6 +287,11 @@ bot.on("callback_query", async (query) => {
         : err instanceof Error
           ? err.message
           : "Помилка Carfax.";
+    log.error("Carfax flow failed", {
+      chatId,
+      error: message,
+      name: err instanceof Error ? err.name : "unknown",
+    });
     if (chatId) await sendText(chatId, message);
   }
 });
@@ -225,8 +301,37 @@ bot.on("message", async (msg) => {
   const text = msg.text?.trim();
   if (!text || text.startsWith("/")) return;
 
+  // LinkedIn draft replies (owner only) take priority over lot parsing
+  if (isLinkedInOwner(chatId) && linkedInEnabled()) {
+    const state = await loadLinkedInState();
+    if (state.pendingDraft && state.pendingDraft.chatId === chatId) {
+      const yn = parseYesNo(text);
+      if (yn === "yes" || yn === "no") {
+        await handleDraftDecision(
+          (t, o) => linkedInNotify(chatId, t, o),
+          chatId,
+          yn
+        );
+        return;
+      }
+      await handleDraftDecision(
+        (t, o) => linkedInNotify(chatId, t, o),
+        chatId,
+        "revise",
+        text
+      );
+      return;
+    }
+  }
+
   const telegramId = String(msg.from?.id ?? chatId);
   const username = msg.from?.username;
+  log.info("Incoming lot message", {
+    chatId,
+    telegramId,
+    username: username ?? null,
+    textPreview: text.slice(0, 160),
+  });
 
   try {
     const result = await processLotFromMessage({
@@ -262,6 +367,13 @@ bot.on("message", async (msg) => {
       },
     });
 
+    log.info("Lot analysis done", {
+      chatId,
+      lotId: result.lotId,
+      vin: result.vin,
+      fromCache: result.fromCache ?? false,
+    });
+
     if (result.vin) {
       await offerCarfax(chatId, result.vin, result.lotId);
     } else {
@@ -273,6 +385,12 @@ bot.on("message", async (msg) => {
   } catch (err) {
     const message =
       err instanceof Error ? err.message : "Сталася невідома помилка.";
+    log.error("Lot processing failed", {
+      chatId,
+      telegramId,
+      error: message,
+      name: err instanceof Error ? err.name : "unknown",
+    });
     await sendText(chatId, message);
   }
 });
@@ -291,8 +409,63 @@ bot.onText(/\/carfax(?:\s+(.+))?/i, async (msg, match) => {
   await offerCarfax(chatId, vin, lastVinByChat.get(chatId)?.lotId);
 });
 
-bot.on("polling_error", (err) => {
-  console.error("Telegram polling error:", err.message);
+bot.onText(/\/li_status/i, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isLinkedInOwner(chatId)) {
+    await sendText(chatId, "LinkedIn лише для власника бота.");
+    return;
+  }
+  const state = await ensureLinkedInSchedule();
+  await sendText(chatId, formatLinkedInStatus(state));
 });
 
+bot.onText(/\/li_post/i, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isLinkedInOwner(chatId)) {
+    await sendText(chatId, "LinkedIn лише для власника бота.");
+    return;
+  }
+  if (!linkedInEnabled()) {
+    await sendText(chatId, "LINKEDIN_ENABLED вимкнено в .env");
+    return;
+  }
+  await generateAndOfferPost((t, o) => linkedInNotify(chatId, t, o), chatId);
+});
+
+bot.onText(/\/li_follow/i, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isLinkedInOwner(chatId)) {
+    await sendText(chatId, "LinkedIn лише для власника бота.");
+    return;
+  }
+  if (!linkedInEnabled()) {
+    await sendText(chatId, "LINKEDIN_ENABLED вимкнено в .env");
+    return;
+  }
+  await runFollowTick((t) => linkedInNotify(chatId, t), { force: true });
+});
+
+bot.on("polling_error", (err) => {
+  log.error("Telegram polling error", { error: err.message });
+});
+
+startLinkedInScheduler(async (text, opts) => {
+  const owner = linkedInOwnerChatId();
+  if (!owner) return;
+  await linkedInNotify(owner, text, opts);
+});
+
+log.info("Copart Telegram bot is running (long polling)", {
+  logFile: getTodayLogPath(),
+  copartCookie: envSet("COPART_COOKIE"),
+  iaaiCookie: envSet("IAAI_COOKIE"),
+  browserDownloads: useBrowserDownloads(),
+  browserHeadless: process.env.BROWSER_HEADLESS || "0",
+  linkedInEnabled: linkedInEnabled(),
+});
 console.log("Copart Telegram bot is running (long polling)...");
+console.log(`[log] файл: ${getTodayLogPath()}`);
+console.log(
+  `[browser] auction downloads via Chrome: ${useBrowserDownloads() ? "ON" : "OFF"}`
+);
+console.log(`[linkedin] autopilot: ${linkedInEnabled() ? "ON" : "OFF"}`);

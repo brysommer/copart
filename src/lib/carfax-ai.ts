@@ -304,6 +304,21 @@ export async function analyzeWindowStickerFile(
     );
   }
 
+  if (ext === ".html" || ext === ".htm" || ext === ".txt") {
+    const raw = await fs.readFile(filePath, "utf8");
+    const text = raw
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 16000);
+    return analyzeStickerContent(
+      vin,
+      `VIN: ${vin}\n\nТекст Window Sticker (з Carfax link):\n${text || "(порожньо)"}`
+    );
+  }
+
   const buf = await fs.readFile(filePath);
   const mime =
     ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
